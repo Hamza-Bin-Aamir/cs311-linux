@@ -859,9 +859,11 @@ __SYSCALL(__NR_file_getattr, sys_file_getattr)
 __SYSCALL(__NR_file_setattr, sys_file_setattr)
 #define __NR_listns 470
 __SYSCALL(__NR_listns, sys_listns)
+#define __NR_mprox_create 471
+__SYSCALL(__NR_mprox_create, sys_mprox_create)
 
 #undef __NR_syscalls
-#define __NR_syscalls 471
+#define __NR_syscalls 472
 
 /*
  * 32 bit systems traditionally used different

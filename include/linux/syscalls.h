@@ -548,6 +548,7 @@ asmlinkage long sys_timerfd_gettime32(int ufd,
 asmlinkage long sys_timerfd_settime32(int ufd, int flags,
 				   const struct old_itimerspec32 __user *utmr,
 				   struct old_itimerspec32 __user *otmr);
+asmlinkage long sys_mprox_create(unsigned int flags);
 asmlinkage long sys_utimensat(int dfd, const char __user *filename,
 				struct __kernel_timespec __user *utimes,
 				int flags);
