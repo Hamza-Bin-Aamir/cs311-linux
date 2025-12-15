@@ -408,6 +408,10 @@ static __poll_t mutex_proxy_poll(struct file *file, poll_table *wait)
  * @inode: Inode associated with the file
  * @file: File structure being released
  *
+ * Handles proper cleanup when fd is closed. Respects O_CLOEXEC semantics:
+ * - Without CLOEXEC: fd can be inherited by child processes (fork)
+ * - With CLOEXEC: fd is closed on exec, proxy disabled
+ *
  * Return: 0 on success
  */
 static int mutex_proxy_release(struct inode *inode, struct file *file)
@@ -417,15 +421,71 @@ static int mutex_proxy_release(struct inode *inode, struct file *file)
 	if (!ctx)
 		return 0;
 
-	pr_debug("mutex_proxy: releasing fd for PID %d\n", ctx->owner_pid);
+	pr_debug("mutex_proxy: releasing fd for PID %d (opened by PID %d)\n",
+		 current->pid, ctx->owner_pid);
 
-	/* Disable the proxy on close */
-	atomic_set(&ctx->enabled, 0);
+	/*
+	 * Check if this is close-on-exec.
+	 * For CLOEXEC fds, explicitly disable the proxy on close.
+	 * For regular fds, children inherit the proxy state via fork.
+	 * Reference counting ensures context stays alive as long as
+	 * any process holds the fd.
+	 */
+	if (ctx->flags & MUTEX_PROXY_CLOEXEC) {
+		pr_debug("mutex_proxy: CLOEXEC set, disabling proxy on close\n");
+		atomic_set(&ctx->enabled, 0);
+	} else {
+		/*
+		 * For non-CLOEXEC fds, leave the proxy enabled.
+		 * Children who inherited this fd will share the same
+		 * proxy configuration and state.
+		 */
+		pr_debug("mutex_proxy: fd inherited, maintaining proxy state\n");
+	}
 
 	/* Release our reference to the context */
 	mutex_proxy_ctx_put(ctx);
 
 	return 0;
+}
+
+/**
+ * mutex_proxy_applies_to_current - Check if proxy applies to current process
+ * @ctx: Proxy context to check
+ *
+ * Determines if the proxy configuration should apply to the current process.
+ * This considers:
+ * - Whether the proxy is enabled
+ * - GLOBAL flag (applies to all system processes)
+ * - fd inheritance (if we have the ctx, we have the fd)
+ *
+ * Return: true if proxy applies, false otherwise
+ */
+bool mutex_proxy_applies_to_current(struct mutex_proxy_context *ctx)
+{
+	if (!ctx || !atomic_read(&ctx->enabled))
+		return false;
+
+	/*
+	 * GLOBAL flag: proxy applies to all processes system-wide.
+	 * This is useful for system-level proxy configuration.
+	 */
+	if (ctx->flags & MUTEX_PROXY_GLOBAL) {
+		pr_debug("mutex_proxy: GLOBAL flag set, applies to all processes\n");
+		return true;
+	}
+
+	/*
+	 * Otherwise, proxy only applies to processes that have the fd.
+	 * This includes:
+	 * - The original owner (creator)
+	 * - Children who inherited the fd via fork()
+	 * - Processes that received the fd via Unix domain socket (SCM_RIGHTS)
+	 *
+	 * If we have access to the context, we have the fd.
+	 */
+	pr_debug("mutex_proxy: proxy applies to PID %d (has fd)\n", current->pid);
+	return true;
 }
 
 static const struct file_operations mutex_proxy_fops = {
