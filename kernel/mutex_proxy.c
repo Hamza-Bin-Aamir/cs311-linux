@@ -23,6 +23,65 @@
 struct mutex_proxy_context;
 
 /**
+ * is_valid_proxy_config - Validate proxy configuration structure
+ * @cfg: Configuration to validate
+ *
+ * Performs comprehensive validation of proxy configuration including:
+ * - Version number (must be 1)
+ * - Proxy type (must be 1-3)
+ * - Port number (must be 1-65535)
+ * - Address validation (at least one byte must be non-zero)
+ *
+ * Return: true if configuration is valid, false otherwise
+ */
+static bool is_valid_proxy_config(const struct mutex_proxy_config *cfg)
+{
+	unsigned int i;
+	bool addr_set = false;
+
+	if (!cfg) {
+		pr_err("mutex_proxy: NULL config pointer\n");
+		return false;
+	}
+
+	/* Check version */
+	if (cfg->version != 1) {
+		pr_warn("mutex_proxy: unsupported config version %u (expected 1)\n",
+			cfg->version);
+		return false;
+	}
+
+	/* Validate proxy type */
+	if (cfg->proxy_type < 1 || cfg->proxy_type > PROXY_TYPE_MAX) {
+		pr_warn("mutex_proxy: invalid proxy type %u (valid range: 1-%u)\n",
+			cfg->proxy_type, PROXY_TYPE_MAX);
+		return false;
+	}
+
+	/* Validate port number (1-65535, 0 is reserved) */
+	if (cfg->proxy_port == 0 || cfg->proxy_port > 65535) {
+		pr_warn("mutex_proxy: invalid proxy port %u (valid range: 1-65535)\n",
+			cfg->proxy_port);
+		return false;
+	}
+
+	/* Check if proxy address is set (at least one byte non-zero) */
+	for (i = 0; i < ARRAY_SIZE(cfg->proxy_addr); i++) {
+		if (cfg->proxy_addr[i] != 0) {
+			addr_set = true;
+			break;
+		}
+	}
+
+	if (!addr_set) {
+		pr_warn("mutex_proxy: proxy address not set (all zeros)\n");
+		return false;
+	}
+
+	return true;
+}
+
+/**
  * struct mutex_proxy_context - Per-fd proxy state
  * @config: Current proxy configuration
  * @stats: Connection and traffic statistics
@@ -110,6 +169,15 @@ static struct mutex_proxy_context *mutex_proxy_ctx_alloc(unsigned int flags)
 
 	/* Allocate connection tracking hash table (1024 buckets) */
 	ctx->conn_table_size = 1024;
+
+	/* Validate conn_table_size to prevent overflow */
+	if (ctx->conn_table_size > 65536) {
+		pr_err("mutex_proxy: conn_table_size %u exceeds maximum\n",
+		       ctx->conn_table_size);
+		kfree(ctx);
+		return NULL;
+	}
+
 	ctx->conn_table = kcalloc(ctx->conn_table_size, sizeof(*ctx->conn_table),
 				  GFP_KERNEL);
 	if (!ctx->conn_table) {
@@ -191,12 +259,45 @@ static ssize_t mutex_proxy_read(struct file *file, char __user *buf,
 	size_t to_copy;
 	size_t offset;
 
-	if (!ctx)
+	/* Validate file pointer */
+	if (unlikely(!file)) {
+		pr_err("mutex_proxy: NULL file pointer in read()\n");
 		return -EINVAL;
+	}
+
+	/* Validate context */
+	if (unlikely(!ctx)) {
+		pr_err("mutex_proxy: NULL context in read()\n");
+		return -EINVAL;
+	}
+
+	/* Validate user buffer pointer */
+	if (unlikely(!buf)) {
+		pr_err("mutex_proxy: NULL buffer pointer in read()\n");
+		return -EINVAL;
+	}
+
+	/* Validate position pointer */
+	if (unlikely(!ppos)) {
+		pr_err("mutex_proxy: NULL position pointer in read()\n");
+		return -EINVAL;
+	}
+
+	/* Check for integer overflow in position */
+	if (unlikely(*ppos < 0)) {
+		pr_err("mutex_proxy: negative position %lld in read()\n", *ppos);
+		return -EINVAL;
+	}
 
 	/* If already at EOF, return 0 */
 	if (*ppos >= sizeof(struct mutex_proxy_stats))
 		return 0;
+
+	/* Validate count to prevent overflow */
+	if (unlikely(count > INT_MAX)) {
+		pr_warn("mutex_proxy: read count %zu exceeds maximum\n", count);
+		count = INT_MAX;
+	}
 
 	/* Copy stats under lock protection */
 	spin_lock_irqsave(&ctx->lock, flags);
@@ -235,34 +336,39 @@ static ssize_t mutex_proxy_write(struct file *file, const char __user *buf,
 	struct mutex_proxy_config new_config;
 	unsigned long flags;
 
-	if (!ctx)
+	/* Validate file pointer */
+	if (unlikely(!file)) {
+		pr_err("mutex_proxy: NULL file pointer in write()\n");
 		return -EINVAL;
+	}
+
+	/* Validate context */
+	if (unlikely(!ctx)) {
+		pr_err("mutex_proxy: NULL context in write()\n");
+		return -EINVAL;
+	}
+
+	/* Validate user buffer pointer */
+	if (unlikely(!buf)) {
+		pr_err("mutex_proxy: NULL buffer pointer in write()\n");
+		return -EINVAL;
+	}
 
 	/* Only accept writes of exact config structure size */
-	if (count != sizeof(struct mutex_proxy_config))
+	if (count != sizeof(struct mutex_proxy_config)) {
+		pr_warn("mutex_proxy: invalid write size %zu (expected %zu)\n",
+			count, sizeof(struct mutex_proxy_config));
 		return -EINVAL;
+	}
 
 	/* Copy config from userspace */
 	if (copy_from_user(&new_config, buf, sizeof(new_config)))
 		return -EFAULT;
 
-	/* Validate configuration */
-	if (new_config.version != 1) {
-		pr_warn("mutex_proxy: invalid config version %u\n",
-			new_config.version);
-		return -EINVAL;
-	}
-
-	if (new_config.proxy_type < 1 ||
-	    new_config.proxy_type > PROXY_TYPE_MAX) {
-		pr_warn("mutex_proxy: invalid proxy type %u\n",
-			new_config.proxy_type);
-		return -EINVAL;
-	}
-
-	if (new_config.proxy_port < 1 || new_config.proxy_port > 65535) {
-		pr_warn("mutex_proxy: invalid proxy port %u\n",
-			new_config.proxy_port);
+	/* Validate configuration using helper */
+	if (!is_valid_proxy_config(&new_config)) {
+		pr_warn("mutex_proxy: configuration validation failed for PID %d\n",
+			current->pid);
 		return -EINVAL;
 	}
 
@@ -314,18 +420,20 @@ static long mutex_proxy_ioctl(struct file *file, unsigned int cmd,
 
 	case MUTEX_PROXY_IOC_SET_CONFIG:
 		/* Set configuration via ioctl */
+		if (!argp) {
+			pr_err("mutex_proxy: NULL argument in SET_CONFIG ioctl\n");
+			return -EINVAL;
+		}
+
 		if (copy_from_user(&config_copy, argp, sizeof(config_copy)))
 			return -EFAULT;
 
-		/* Validate configuration */
-		if (config_copy.version != 1)
+		/* Validate configuration using helper */
+		if (!is_valid_proxy_config(&config_copy)) {
+			pr_warn("mutex_proxy: SET_CONFIG validation failed for PID %d\n",
+				current->pid);
 			return -EINVAL;
-		if (config_copy.proxy_type < 1 ||
-		    config_copy.proxy_type > PROXY_TYPE_MAX)
-			return -EINVAL;
-		if (config_copy.proxy_port < 1 ||
-		    config_copy.proxy_port > 65535)
-			return -EINVAL;
+		}
 
 		/* Update atomically */
 		spin_lock_irqsave(&ctx->lock, flags);
@@ -338,6 +446,11 @@ static long mutex_proxy_ioctl(struct file *file, unsigned int cmd,
 
 	case MUTEX_PROXY_IOC_GET_CONFIG:
 		/* Get current configuration */
+		if (!argp) {
+			pr_err("mutex_proxy: NULL argument in GET_CONFIG ioctl\n");
+			return -EINVAL;
+		}
+
 		spin_lock_irqsave(&ctx->lock, flags);
 		memcpy(&config_copy, &ctx->config, sizeof(config_copy));
 		spin_unlock_irqrestore(&ctx->lock, flags);
@@ -351,6 +464,10 @@ static long mutex_proxy_ioctl(struct file *file, unsigned int cmd,
 
 	case MUTEX_PROXY_IOC_GET_STATS:
 		/* Get current statistics */
+		if (!argp) {
+			pr_err("mutex_proxy: NULL argument in GET_STATS ioctl\n");
+			return -EINVAL;
+		}
 		spin_lock_irqsave(&ctx->lock, flags);
 		memcpy(&stats_copy, &ctx->stats, sizeof(stats_copy));
 		spin_unlock_irqrestore(&ctx->lock, flags);
