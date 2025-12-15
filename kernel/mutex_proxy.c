@@ -11,6 +11,7 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/mutex_proxy.h>
 #include <linux/poll.h>
 #include <linux/slab.h>
@@ -18,6 +19,31 @@
 #include <linux/syscalls.h>
 #include <linux/uaccess.h>
 #include <uapi/linux/mutex_proxy.h>
+
+/* Module parameters */
+static bool debug_enabled = false;
+module_param_named(debug, debug_enabled, bool, 0644);
+MODULE_PARM_DESC(debug, "Enable debug logging (default: false)");
+
+static unsigned int default_conn_table_size = 1024;
+module_param_named(conn_table_size, default_conn_table_size, uint, 0444);
+MODULE_PARM_DESC(conn_table_size, "Default connection table size (default: 1024)");
+
+/* Logging macros */
+#define mpx_debug(fmt, ...) \
+	do { \
+		if (debug_enabled) \
+			mpx_debug("" fmt, ##__VA_ARGS__); \
+	} while (0)
+
+#define mpx_info(fmt, ...) \
+	mpx_info("" fmt, ##__VA_ARGS__)
+
+#define mpx_warn(fmt, ...) \
+	mpx_warn("" fmt, ##__VA_ARGS__)
+
+#define mpx_err(fmt, ...) \
+	mpx_err("" fmt, ##__VA_ARGS__)
 
 /* Forward declarations */
 struct mutex_proxy_context;
@@ -40,27 +66,27 @@ static bool is_valid_proxy_config(const struct mutex_proxy_config *cfg)
 	bool addr_set = false;
 
 	if (!cfg) {
-		pr_err("mutex_proxy: NULL config pointer\n");
+		mpx_err("NULL config pointer\n");
 		return false;
 	}
 
 	/* Check version */
 	if (cfg->version != 1) {
-		pr_warn("mutex_proxy: unsupported config version %u (expected 1)\n",
+		mpx_warn("unsupported config version %u (expected 1)\n",
 			cfg->version);
 		return false;
 	}
 
 	/* Validate proxy type */
 	if (cfg->proxy_type < 1 || cfg->proxy_type > PROXY_TYPE_MAX) {
-		pr_warn("mutex_proxy: invalid proxy type %u (valid range: 1-%u)\n",
+		mpx_warn("invalid proxy type %u (valid range: 1-%u)\n",
 			cfg->proxy_type, PROXY_TYPE_MAX);
 		return false;
 	}
 
 	/* Validate port number (1-65535, 0 is reserved) */
 	if (cfg->proxy_port == 0 || cfg->proxy_port > 65535) {
-		pr_warn("mutex_proxy: invalid proxy port %u (valid range: 1-65535)\n",
+		mpx_warn("invalid proxy port %u (valid range: 1-65535)\n",
 			cfg->proxy_port);
 		return false;
 	}
@@ -74,7 +100,7 @@ static bool is_valid_proxy_config(const struct mutex_proxy_config *cfg)
 	}
 
 	if (!addr_set) {
-		pr_warn("mutex_proxy: proxy address not set (all zeros)\n");
+		mpx_warn("proxy address not set (all zeros)\n");
 		return false;
 	}
 
@@ -139,7 +165,7 @@ static struct mutex_proxy_context *mutex_proxy_ctx_alloc(unsigned int flags)
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx) {
-		pr_err("mutex_proxy: Failed to allocate context\n");
+		mpx_err("Failed to allocate context\n");
 		return NULL;
 	}
 
@@ -167,21 +193,25 @@ static struct mutex_proxy_context *mutex_proxy_ctx_alloc(unsigned int flags)
 	/* Initialize statistics */
 	memset(&ctx->stats, 0, sizeof(ctx->stats));
 
-	/* Allocate connection tracking hash table (1024 buckets) */
-	ctx->conn_table_size = 1024;
+	/* Allocate connection tracking hash table (use module parameter) */
+	ctx->conn_table_size = default_conn_table_size;
 
 	/* Validate conn_table_size to prevent overflow */
 	if (ctx->conn_table_size > 65536) {
-		pr_err("mutex_proxy: conn_table_size %u exceeds maximum\n",
-		       ctx->conn_table_size);
-		kfree(ctx);
-		return NULL;
+		mpx_err("conn_table_size %u exceeds maximum, using 65536\n",
+			ctx->conn_table_size);
+		ctx->conn_table_size = 65536;
+	}
+
+	if (ctx->conn_table_size == 0) {
+		mpx_err("conn_table_size cannot be 0, using default 1024\n");
+		ctx->conn_table_size = 1024;
 	}
 
 	ctx->conn_table = kcalloc(ctx->conn_table_size, sizeof(*ctx->conn_table),
 				  GFP_KERNEL);
 	if (!ctx->conn_table) {
-		pr_err("mutex_proxy: Failed to allocate connection table\n");
+		mpx_err("Failed to allocate connection table\n");
 		kfree(ctx);
 		return NULL;
 	}
@@ -194,9 +224,10 @@ static struct mutex_proxy_context *mutex_proxy_ctx_alloc(unsigned int flags)
 	init_waitqueue_head(&ctx->wait);
 	ctx->event_count = 0;
 
-	pr_debug("mutex_proxy: allocated context for PID %d (UID %u, GID %u)\n",
-		 ctx->owner_pid, from_kuid(&init_user_ns, ctx->owner_uid),
-		 from_kgid(&init_user_ns, ctx->owner_gid));
+	mpx_debug("allocated context for PID %d (UID %u, GID %u, conn_table_size=%u)\n",
+		  ctx->owner_pid, from_kuid(&init_user_ns, ctx->owner_uid),
+		  from_kgid(&init_user_ns, ctx->owner_gid),
+		  ctx->conn_table_size);
 
 	return ctx;
 }
@@ -220,7 +251,7 @@ static void mutex_proxy_ctx_destroy_rcu(struct rcu_head *rcu)
 
 	ctx = container_of(rcu, struct mutex_proxy_context, rcu);
 
-	pr_debug("mutex_proxy: destroying context for PID %d\n", ctx->owner_pid);
+	mpx_debug("destroying context for PID %d\n", ctx->owner_pid);
 
 	/* Free connection table */
 	kfree(ctx->conn_table);
@@ -261,31 +292,31 @@ static ssize_t mutex_proxy_read(struct file *file, char __user *buf,
 
 	/* Validate file pointer */
 	if (unlikely(!file)) {
-		pr_err("mutex_proxy: NULL file pointer in read()\n");
+		mpx_err("NULL file pointer in read()\n");
 		return -EINVAL;
 	}
 
 	/* Validate context */
 	if (unlikely(!ctx)) {
-		pr_err("mutex_proxy: NULL context in read()\n");
+		mpx_err("NULL context in read()\n");
 		return -EINVAL;
 	}
 
 	/* Validate user buffer pointer */
 	if (unlikely(!buf)) {
-		pr_err("mutex_proxy: NULL buffer pointer in read()\n");
+		mpx_err("NULL buffer pointer in read()\n");
 		return -EINVAL;
 	}
 
 	/* Validate position pointer */
 	if (unlikely(!ppos)) {
-		pr_err("mutex_proxy: NULL position pointer in read()\n");
+		mpx_err("NULL position pointer in read()\n");
 		return -EINVAL;
 	}
 
 	/* Check for integer overflow in position */
 	if (unlikely(*ppos < 0)) {
-		pr_err("mutex_proxy: negative position %lld in read()\n", *ppos);
+		mpx_err("negative position %lld in read()\n", *ppos);
 		return -EINVAL;
 	}
 
@@ -295,7 +326,7 @@ static ssize_t mutex_proxy_read(struct file *file, char __user *buf,
 
 	/* Validate count to prevent overflow */
 	if (unlikely(count > INT_MAX)) {
-		pr_warn("mutex_proxy: read count %zu exceeds maximum\n", count);
+		mpx_warn("read count %zu exceeds maximum\n", count);
 		count = INT_MAX;
 	}
 
@@ -314,7 +345,7 @@ static ssize_t mutex_proxy_read(struct file *file, char __user *buf,
 
 	*ppos += to_copy;
 
-	pr_debug("mutex_proxy: read %zu bytes of statistics for PID %d\n",
+	mpx_debug("read %zu bytes of statistics for PID %d\n",
 		 to_copy, ctx->owner_pid);
 
 	return to_copy;
@@ -338,25 +369,25 @@ static ssize_t mutex_proxy_write(struct file *file, const char __user *buf,
 
 	/* Validate file pointer */
 	if (unlikely(!file)) {
-		pr_err("mutex_proxy: NULL file pointer in write()\n");
+		mpx_err("NULL file pointer in write()\n");
 		return -EINVAL;
 	}
 
 	/* Validate context */
 	if (unlikely(!ctx)) {
-		pr_err("mutex_proxy: NULL context in write()\n");
+		mpx_err("NULL context in write()\n");
 		return -EINVAL;
 	}
 
 	/* Validate user buffer pointer */
 	if (unlikely(!buf)) {
-		pr_err("mutex_proxy: NULL buffer pointer in write()\n");
+		mpx_err("NULL buffer pointer in write()\n");
 		return -EINVAL;
 	}
 
 	/* Only accept writes of exact config structure size */
 	if (count != sizeof(struct mutex_proxy_config)) {
-		pr_warn("mutex_proxy: invalid write size %zu (expected %zu)\n",
+		mpx_warn("invalid write size %zu (expected %zu)\n",
 			count, sizeof(struct mutex_proxy_config));
 		return -EINVAL;
 	}
@@ -367,7 +398,7 @@ static ssize_t mutex_proxy_write(struct file *file, const char __user *buf,
 
 	/* Validate configuration using helper */
 	if (!is_valid_proxy_config(&new_config)) {
-		pr_warn("mutex_proxy: configuration validation failed for PID %d\n",
+		mpx_warn("configuration validation failed for PID %d\n",
 			current->pid);
 		return -EINVAL;
 	}
@@ -377,7 +408,7 @@ static ssize_t mutex_proxy_write(struct file *file, const char __user *buf,
 	memcpy(&ctx->config, &new_config, sizeof(ctx->config));
 	spin_unlock_irqrestore(&ctx->lock, flags);
 
-	pr_debug("mutex_proxy: updated config for PID %d (type=%u, port=%u)\n",
+	mpx_debug("updated config for PID %d (type=%u, port=%u)\n",
 		 ctx->owner_pid, new_config.proxy_type, new_config.proxy_port);
 
 	return count;
@@ -407,21 +438,21 @@ static long mutex_proxy_ioctl(struct file *file, unsigned int cmd,
 	case MUTEX_PROXY_IOC_ENABLE:
 		/* Enable the proxy */
 		atomic_set(&ctx->enabled, 1);
-		pr_debug("mutex_proxy: enabled proxy for PID %d\n",
+		mpx_debug("enabled proxy for PID %d\n",
 			 ctx->owner_pid);
 		return 0;
 
 	case MUTEX_PROXY_IOC_DISABLE:
 		/* Disable the proxy */
 		atomic_set(&ctx->enabled, 0);
-		pr_debug("mutex_proxy: disabled proxy for PID %d\n",
+		mpx_debug("disabled proxy for PID %d\n",
 			 ctx->owner_pid);
 		return 0;
 
 	case MUTEX_PROXY_IOC_SET_CONFIG:
 		/* Set configuration via ioctl */
 		if (!argp) {
-			pr_err("mutex_proxy: NULL argument in SET_CONFIG ioctl\n");
+			mpx_err("NULL argument in SET_CONFIG ioctl\n");
 			return -EINVAL;
 		}
 
@@ -430,7 +461,7 @@ static long mutex_proxy_ioctl(struct file *file, unsigned int cmd,
 
 		/* Validate configuration using helper */
 		if (!is_valid_proxy_config(&config_copy)) {
-			pr_warn("mutex_proxy: SET_CONFIG validation failed for PID %d\n",
+			mpx_warn("SET_CONFIG validation failed for PID %d\n",
 				current->pid);
 			return -EINVAL;
 		}
@@ -440,14 +471,14 @@ static long mutex_proxy_ioctl(struct file *file, unsigned int cmd,
 		memcpy(&ctx->config, &config_copy, sizeof(ctx->config));
 		spin_unlock_irqrestore(&ctx->lock, flags);
 
-		pr_debug("mutex_proxy: set config for PID %d via ioctl\n",
+		mpx_debug("set config for PID %d via ioctl\n",
 			 ctx->owner_pid);
 		return 0;
 
 	case MUTEX_PROXY_IOC_GET_CONFIG:
 		/* Get current configuration */
 		if (!argp) {
-			pr_err("mutex_proxy: NULL argument in GET_CONFIG ioctl\n");
+			mpx_err("NULL argument in GET_CONFIG ioctl\n");
 			return -EINVAL;
 		}
 
@@ -458,14 +489,14 @@ static long mutex_proxy_ioctl(struct file *file, unsigned int cmd,
 		if (copy_to_user(argp, &config_copy, sizeof(config_copy)))
 			return -EFAULT;
 
-		pr_debug("mutex_proxy: get config for PID %d via ioctl\n",
+		mpx_debug("get config for PID %d via ioctl\n",
 			 ctx->owner_pid);
 		return 0;
 
 	case MUTEX_PROXY_IOC_GET_STATS:
 		/* Get current statistics */
 		if (!argp) {
-			pr_err("mutex_proxy: NULL argument in GET_STATS ioctl\n");
+			mpx_err("NULL argument in GET_STATS ioctl\n");
 			return -EINVAL;
 		}
 		spin_lock_irqsave(&ctx->lock, flags);
@@ -475,12 +506,12 @@ static long mutex_proxy_ioctl(struct file *file, unsigned int cmd,
 		if (copy_to_user(argp, &stats_copy, sizeof(stats_copy)))
 			return -EFAULT;
 
-		pr_debug("mutex_proxy: get stats for PID %d via ioctl\n",
+		mpx_debug("get stats for PID %d via ioctl\n",
 			 ctx->owner_pid);
 		return 0;
 
 	default:
-		pr_warn("mutex_proxy: unknown ioctl command 0x%x from PID %d\n",
+		mpx_warn("unknown ioctl command 0x%x from PID %d\n",
 			cmd, ctx->owner_pid);
 		return -ENOTTY;
 	}
@@ -514,7 +545,7 @@ static __poll_t mutex_proxy_poll(struct file *file, poll_table *wait)
 	if (!atomic_read(&ctx->enabled))
 		events |= POLLHUP;
 
-	pr_debug("mutex_proxy: poll() for PID %d, events=0x%x\n",
+	mpx_debug("poll() for PID %d, events=0x%x\n",
 		 ctx->owner_pid, events);
 
 	return events;
@@ -538,7 +569,7 @@ static int mutex_proxy_release(struct inode *inode, struct file *file)
 	if (!ctx)
 		return 0;
 
-	pr_debug("mutex_proxy: releasing fd for PID %d (opened by PID %d)\n",
+	mpx_debug("releasing fd for PID %d (opened by PID %d)\n",
 		 current->pid, ctx->owner_pid);
 
 	/*
@@ -549,7 +580,7 @@ static int mutex_proxy_release(struct inode *inode, struct file *file)
 	 * any process holds the fd.
 	 */
 	if (ctx->flags & MUTEX_PROXY_CLOEXEC) {
-		pr_debug("mutex_proxy: CLOEXEC set, disabling proxy on close\n");
+		mpx_debug("CLOEXEC set, disabling proxy on close\n");
 		atomic_set(&ctx->enabled, 0);
 	} else {
 		/*
@@ -557,7 +588,7 @@ static int mutex_proxy_release(struct inode *inode, struct file *file)
 		 * Children who inherited this fd will share the same
 		 * proxy configuration and state.
 		 */
-		pr_debug("mutex_proxy: fd inherited, maintaining proxy state\n");
+		mpx_debug("fd inherited, maintaining proxy state\n");
 	}
 
 	/* Release our reference to the context */
@@ -588,7 +619,7 @@ bool mutex_proxy_applies_to_current(struct mutex_proxy_context *ctx)
 	 * This is useful for system-level proxy configuration.
 	 */
 	if (ctx->flags & MUTEX_PROXY_GLOBAL) {
-		pr_debug("mutex_proxy: GLOBAL flag set, applies to all processes\n");
+		mpx_debug("GLOBAL flag set, applies to all processes\n");
 		return true;
 	}
 
@@ -601,7 +632,7 @@ bool mutex_proxy_applies_to_current(struct mutex_proxy_context *ctx)
 	 *
 	 * If we have access to the context, we have the fd.
 	 */
-	pr_debug("mutex_proxy: proxy applies to PID %d (has fd)\n", current->pid);
+	mpx_debug("proxy applies to PID %d (has fd)\n", current->pid);
 	return true;
 }
 
@@ -638,11 +669,11 @@ static int mutex_proxy_create_fd(struct mutex_proxy_context *ctx,
 	/* Create anonymous inode with our file operations */
 	fd = anon_inode_getfd("[mutex_proxy]", &mutex_proxy_fops, ctx, o_flags);
 	if (fd < 0) {
-		pr_err("mutex_proxy: Failed to create anon_inode fd: %d\n", fd);
+		mpx_err("Failed to create anon_inode fd: %d\n", fd);
 		return fd;
 	}
 
-	pr_debug("mutex_proxy: created fd %d for PID %d\n", fd, ctx->owner_pid);
+	mpx_debug("created fd %d for PID %d\n", fd, ctx->owner_pid);
 
 	return fd;
 }
@@ -663,14 +694,14 @@ SYSCALL_DEFINE1(mutex_proxy_create, unsigned int, flags)
 
 	/* Check for CAP_NET_ADMIN capability */
 	if (!capable(CAP_NET_ADMIN)) {
-		pr_warn("mutex_proxy: Process %d (%s) lacks CAP_NET_ADMIN\n",
+		mpx_warn("Process %d (%s) lacks CAP_NET_ADMIN\n",
 			current->pid, current->comm);
 		return -EPERM;
 	}
 
 	/* Validate flags */
 	if (flags & ~MUTEX_PROXY_ALL_FLAGS) {
-		pr_warn("mutex_proxy: Invalid flags 0x%x from process %d\n",
+		mpx_warn("Invalid flags 0x%x from process %d\n",
 			flags, current->pid);
 		return -EINVAL;
 	}
@@ -678,7 +709,7 @@ SYSCALL_DEFINE1(mutex_proxy_create, unsigned int, flags)
 	/* Allocate and initialize proxy context */
 	ctx = mutex_proxy_ctx_alloc(flags);
 	if (!ctx) {
-		pr_err("mutex_proxy: Failed to allocate context for process %d\n",
+		mpx_err("Failed to allocate context for process %d\n",
 		       current->pid);
 		return -ENOMEM;
 	}
@@ -686,15 +717,69 @@ SYSCALL_DEFINE1(mutex_proxy_create, unsigned int, flags)
 	/* Create file descriptor with anonymous inode */
 	fd = mutex_proxy_create_fd(ctx, flags);
 	if (fd < 0) {
-		pr_err("mutex_proxy: Failed to create fd for process %d: %d\n",
+		mpx_err("Failed to create fd for process %d: %d\n",
 		       current->pid, fd);
 		/* Release the context reference */
 		mutex_proxy_ctx_put(ctx);
 		return fd;
 	}
 
-	pr_info("mutex_proxy: Created fd %d for process %d (%s) with flags 0x%x\n",
+	mpx_info("Created fd %d for process %d (%s) with flags 0x%x\n",
 		fd, current->pid, current->comm, flags);
 
 	return fd;
 }
+
+/**
+ * mutex_proxy_init - Module initialization
+ *
+ * Called when the module is loaded into the kernel.
+ * Performs any necessary one-time setup and parameter validation.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int __init mutex_proxy_init(void)
+{
+	mpx_info("initializing mutex_proxy kernel module\n");
+	mpx_info("debug logging: %s\n", debug_enabled ? "enabled" : "disabled");
+	mpx_info("default conn_table_size: %u\n", default_conn_table_size);
+
+	/* Validate module parameters */
+	if (default_conn_table_size == 0) {
+		mpx_warn("conn_table_size cannot be 0, using default 1024\n");
+		default_conn_table_size = 1024;
+	}
+
+	if (default_conn_table_size > 65536) {
+		mpx_warn("conn_table_size %u exceeds maximum, capping at 65536\n",
+			 default_conn_table_size);
+		default_conn_table_size = 65536;
+	}
+
+	mpx_info("mutex_proxy module loaded successfully\n");
+	return 0;
+}
+
+/**
+ * mutex_proxy_exit - Module cleanup
+ *
+ * Called when the module is unloaded from the kernel.
+ * Note: Active file descriptors will keep their contexts alive
+ * via reference counting. Contexts are freed via RCU when all
+ * references are dropped (all fds closed).
+ */
+static void __exit mutex_proxy_exit(void)
+{
+	mpx_info("unloading mutex_proxy module\n");
+	mpx_info("note: active fds will remain valid until closed\n");
+	mpx_info("contexts will be freed via RCU when all references drop\n");
+	mpx_info("mutex_proxy module unloaded\n");
+}
+
+module_init(mutex_proxy_init);
+module_exit(mutex_proxy_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("MUTEX Team <mutex@example.com>");
+MODULE_DESCRIPTION("Kernel-level proxy control via file descriptor");
+MODULE_VERSION("0.1.0");
