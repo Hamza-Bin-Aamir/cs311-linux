@@ -39,14 +39,39 @@
 #define PROXY_TYPE_HTTPS	3
 #define PROXY_TYPE_MAX		3
 
-/* Configuration structure for proxy settings */
+/* Maximum number of proxy servers per configuration */
+#define MUTEX_PROXY_MAX_SERVERS	8
+
+/* Proxy selection strategies */
+#define PROXY_SELECT_ROUND_ROBIN	1
+#define PROXY_SELECT_FAILOVER		2
+#define PROXY_SELECT_RANDOM		3
+
+/* Server configuration flags */
+#define PROXY_CONFIG_IPV6		(1 << 0)	/* Server uses IPv6 */
+#define PROXY_CONFIG_ACTIVE		(1 << 1)	/* Server is active */
+#define PROXY_CONFIG_AUTH		(1 << 2)	/* Authentication required */
+
+/* Proxy server configuration */
+struct mutex_proxy_server {
+	__u32 proxy_type;		/* SOCKS5, HTTP, etc. */
+	__u32 proxy_port;		/* Proxy server port */
+	__u32 flags;			/* PROXY_CONFIG_* flags */
+	__u32 priority;			/* Priority for failover (lower = higher priority) */
+	__u8  proxy_addr[16];		/* IPv4/IPv6 address */
+	__u8  username[64];		/* Authentication username */
+	__u8  password[64];		/* Authentication password */
+	__u8  reserved[32];		/* Reserved for future use */
+};
+
+/* Configuration structure for proxy settings (multi-server support) */
 struct mutex_proxy_config {
-	__u32 version;		/* API version, currently 1 */
-	__u32 proxy_type;	/* SOCKS5, HTTP, etc. */
-	__u32 proxy_port;	/* Proxy server port */
-	__u32 flags;		/* Configuration flags */
-	__u8  proxy_addr[16];	/* IPv4/IPv6 address */
-	__u8  reserved[64];	/* Reserved for future use */
+	__u32 version;			/* API version, currently 1 */
+	__u32 num_servers;		/* Number of configured servers */
+	__u32 selection_strategy;	/* PROXY_SELECT_* */
+	__u32 current_server;		/* Currently selected server index */
+	struct mutex_proxy_server servers[MUTEX_PROXY_MAX_SERVERS];
+	__u8  reserved[64];		/* Reserved for future use */
 };
 
 /* Statistics structure for proxy monitoring */
