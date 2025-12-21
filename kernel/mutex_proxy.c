@@ -723,7 +723,7 @@ static int mutex_proxy_create_fd(struct mutex_proxy_context *ctx,
  *
  * Return: File descriptor on success, negative error code on failure
  */
-SYSCALL_DEFINE1(mutex_proxy_create, unsigned int, flags)
+SYSCALL_DEFINE1(mprox_create, unsigned int, flags)
 {
 	struct mutex_proxy_context *ctx;
 	int fd;
